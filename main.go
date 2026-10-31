@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const model = "gemini-3.5-flash-lite"
+const model = "gemini-3.5-flash-liteS"
 
 var client = &http.Client{Timeout: 15 * time.Second}
 
