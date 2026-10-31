@@ -8,12 +8,34 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 )
 
-const model = "gemini-3.8-flash"
+const model = "gemini-3.5-flash-lite"
+
+var client = &http.Client{Timeout: 15 * time.Second}
 
 type chatReq struct {
 	Prompt string `json:"prompt"`
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func logging(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: 200}
+		next(rec, r)
+		log.Printf("%s %s -> %d (%v)", r.Method, r.URL.Path, rec.status, time.Since(start))
+	}
 }
 
 func chatHandler(w http.ResponseWriter, r *http.Request) {
@@ -38,13 +60,12 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	gr.Header.Set("Content-Type", "application/json")
 	gr.Header.Set("x-goog-api-key", os.Getenv("GEMINI_API_KEY"))
 
-	resp, err := http.DefaultClient.Do(gr)
+	resp, err := client.Do(gr)
 	if err != nil {
 		log.Println("upstream error:", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
-
 	defer resp.Body.Close()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -53,7 +74,10 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	http.HandleFunc("/chat", chatHandler)
-	log.Println("listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	if os.Getenv("GEMINI_API_KEY") == "" {
+		log.Fatal("GEMINI_API_KEY is not set")
+	}
+	http.HandleFunc("/chat", logging(chatHandler))
+	log.Println("listening on 127.0.0.1:8080")
+	log.Fatal(http.ListenAndServe("127.0.0.1:8080", nil))
 }
