@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const primaryModel = "gemini-3.8-flash-lite"
+const primaryModel = "gemini-3.8-flash"
 const fallbackModel = "gemini-3.5-flash-lite"
 
 var client = &http.Client{Timeout: 15 * time.Second}
