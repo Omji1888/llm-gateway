@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-const model = "gemini-3.5-flash-lite"
+const primaryModel = "gemini-3.8-flash-lite"
+const fallbackModel = "gemini-3.5-flash-lite"
 
 var client = &http.Client{Timeout: 15 * time.Second}
 
@@ -52,8 +53,8 @@ type bucket struct {
 type limiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
-	rate    float64 // tokens added per second
-	burst   float64 // max tokens a bucket can hold
+	rate    float64
+	burst   float64
 }
 
 func newLimiter(rate, burst float64) *limiter {
@@ -99,6 +100,69 @@ func rateLimit(l *limiter, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ---------- circuit breaker ----------
+
+type breaker struct {
+	mu        sync.Mutex
+	failures  int
+	openUntil time.Time
+	threshold int
+	cooldown  time.Duration
+}
+
+func newBreaker(threshold int, cooldown time.Duration) *breaker {
+	return &breaker{threshold: threshold, cooldown: cooldown}
+}
+
+// allow returns false while the breaker is open.
+// After the cooldown it lets requests through again; one more
+// failure re-opens it immediately, one success resets it.
+func (b *breaker) allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !time.Now().Before(b.openUntil)
+}
+
+func (b *breaker) record(success bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if success {
+		b.failures = 0
+		return
+	}
+	b.failures++
+	if b.failures >= b.threshold {
+		b.openUntil = time.Now().Add(b.cooldown)
+	}
+}
+
+var breakers = map[string]*breaker{
+	primaryModel:  newBreaker(3, 30*time.Second),
+	fallbackModel: newBreaker(3, 30*time.Second),
+}
+
+// ---------- calling Gemini ----------
+
+func callModel(model string, body []byte) (*http.Response, error) {
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", model)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", os.Getenv("GEMINI_API_KEY"))
+	return client.Do(req)
+}
+
+// a response counts as a failure if the model is unavailable or overloaded
+func isFailure(resp *http.Response, err error) bool {
+	if err != nil {
+		return true
+	}
+	c := resp.StatusCode
+	return c == 404 || c == 429 || c >= 500
+}
+
 // ---------- chat handler ----------
 
 func chatHandler(w http.ResponseWriter, r *http.Request) {
@@ -118,29 +182,40 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", model)
-	gr, _ := http.NewRequest("POST", url, bytes.NewReader(body))
-	gr.Header.Set("Content-Type", "application/json")
-	gr.Header.Set("x-goog-api-key", os.Getenv("GEMINI_API_KEY"))
+	for _, m := range []string{primaryModel, fallbackModel} {
+		br := breakers[m]
+		if !br.allow() {
+			log.Printf("breaker open for %s, skipping", m)
+			continue
+		}
 
-	resp, err := client.Do(gr)
-	if err != nil {
-		log.Println("upstream error:", err)
-		http.Error(w, "upstream error", http.StatusBadGateway)
+		resp, err := callModel(m, body)
+		if isFailure(resp, err) {
+			br.record(false)
+			log.Printf("model %s failed (err=%v), trying next", m, err)
+			if resp != nil {
+				resp.Body.Close()
+			}
+			continue
+		}
+
+		br.record(true)
+		defer resp.Body.Close()
+		w.Header().Set("X-Model-Used", m)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
-	defer resp.Body.Close()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	http.Error(w, "all models unavailable", http.StatusServiceUnavailable)
 }
 
 func main() {
 	if os.Getenv("GEMINI_API_KEY") == "" {
 		log.Fatal("GEMINI_API_KEY is not set")
 	}
-	lim := newLimiter(1, 3) // 1 request/sec, burst of 3
+	lim := newLimiter(1, 3)
 	http.HandleFunc("/chat", logging(rateLimit(lim, chatHandler)))
 	log.Println("listening on 127.0.0.1:8080")
 	log.Fatal(http.ListenAndServe("127.0.0.1:8080", nil))
