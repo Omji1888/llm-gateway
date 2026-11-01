@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ const primaryModel = "gemini-3.8-flash"
 const fallbackModel = "gemini-3.5-flash-lite"
 
 var client = &http.Client{Timeout: 15 * time.Second}
+var primaryClient = &http.Client{Timeout: 6 * time.Second}
 
 type chatReq struct {
 	Prompt string `json:"prompt"`
@@ -114,9 +116,6 @@ func newBreaker(threshold int, cooldown time.Duration) *breaker {
 	return &breaker{threshold: threshold, cooldown: cooldown}
 }
 
-// allow returns false while the breaker is open.
-// After the cooldown it lets requests through again; one more
-// failure re-opens it immediately, one success resets it.
 func (b *breaker) allow() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -141,6 +140,107 @@ var breakers = map[string]*breaker{
 	fallbackModel: newBreaker(3, 30*time.Second),
 }
 
+// ---------- semantic cache ----------
+
+const embedModel = "gemini-embedding-001"
+const cacheThreshold = 0.90
+const cacheMax = 500
+const cacheTTL = time.Hour
+
+type cacheEntry struct {
+	embedding []float64
+	response  []byte
+	model     string
+	expires   time.Time
+}
+
+type semanticCache struct {
+	mu      sync.Mutex
+	entries []cacheEntry
+}
+
+var cache = &semanticCache{}
+
+func embed(text string) ([]float64, error) {
+	body, _ := json.Marshal(map[string]any{
+		"model":    "models/" + embedModel,
+		"taskType": "SEMANTIC_SIMILARITY",
+		"content": map[string]any{
+			"parts": []any{map[string]any{"text": text}},
+		},
+	})
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:embedContent", embedModel)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", os.Getenv("GEMINI_API_KEY"))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("embed status %d", resp.StatusCode)
+	}
+
+	var out struct {
+		Embedding struct {
+			Values []float64 `json:"values"`
+		} `json:"embedding"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Embedding.Values, nil
+}
+
+func cosine(a, b []float64) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+	var dot, na, nb float64
+	for i := range a {
+		dot += a[i] * b[i]
+		na += a[i] * a[i]
+		nb += b[i] * b[i]
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+func (c *semanticCache) lookup(emb []float64) (cacheEntry, float64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	best := -1.0
+	var bestEntry cacheEntry
+	for _, e := range c.entries {
+		if now.After(e.expires) {
+			continue
+		}
+		s := cosine(emb, e.embedding)
+		if s > best {
+			best = s
+			bestEntry = e
+		}
+	}
+	return bestEntry, best, best >= cacheThreshold
+}
+
+func (c *semanticCache) store(e cacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.entries) >= cacheMax {
+		c.entries = c.entries[1:]
+	}
+	c.entries = append(c.entries, e)
+}
+
 // ---------- calling Gemini ----------
 
 func callModel(model string, body []byte) (*http.Response, error) {
@@ -151,10 +251,14 @@ func callModel(model string, body []byte) (*http.Response, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-goog-api-key", os.Getenv("GEMINI_API_KEY"))
-	return client.Do(req)
+
+	c := client
+	if model == primaryModel {
+		c = primaryClient
+	}
+	return c.Do(req)
 }
 
-// a response counts as a failure if the model is unavailable or overloaded
 func isFailure(resp *http.Response, err error) bool {
 	if err != nil {
 		return true
@@ -174,6 +278,24 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
+	}
+
+	emb, embErr := embed(req.Prompt)
+	if embErr != nil {
+		log.Println("embed error (cache skipped):", embErr)
+	} else {
+		e, sim, hit := cache.lookup(emb)
+		if hit {
+			log.Printf("cache HIT sim=%.3f", sim)
+			w.Header().Set("X-Cache", "HIT")
+			w.Header().Set("X-Model-Used", e.model)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(e.response)
+			return
+		}
+		if sim >= 0 {
+			log.Printf("cache MISS best sim=%.3f", sim)
+		}
 	}
 
 	body, _ := json.Marshal(map[string]any{
@@ -200,11 +322,23 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		br.record(true)
-		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == 200 && embErr == nil {
+			cache.store(cacheEntry{
+				embedding: emb,
+				response:  data,
+				model:     m,
+				expires:   time.Now().Add(cacheTTL),
+			})
+		}
+
+		w.Header().Set("X-Cache", "MISS")
 		w.Header().Set("X-Model-Used", m)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		w.Write(data)
 		return
 	}
 
