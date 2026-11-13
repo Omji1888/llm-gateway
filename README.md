@@ -2,6 +2,7 @@
 
 A reliability layer in Go that sits between an app and the Gemini API.
 Built from scratch with the standard library only (no frameworks).
+client → rate limiter → semantic cache → primary Gemini (6s timeout) → circuit breaker → fallback model.
 
 ## Features
 - **Proxy** `POST /chat` forwarding to Gemini
